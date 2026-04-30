@@ -4,9 +4,14 @@ A Rust implementation of the **DRAIN** log parsing algorithm — an online algor
 
 DRAIN processes each log line in a single pass and immediately assigns it to a cluster (or creates a new one), making it suitable for streaming log pipelines and real-time analysis.
 
-## Usage
+## Features
 
-Add to `Cargo.toml`:
+- Online clustering — no pre-training, handles unbounded log streams
+- Configurable masking — replace noisy tokens (numbers, IPs, UUIDs, …) before clustering
+- Change detection — know whether a parse event created a new cluster, refined an existing template, or matched without change
+- JSON persistence — save and restore the full parser state (clusters + prefix tree + mask config)
+
+## Quick start
 
 ```toml
 [dependencies]
@@ -14,38 +19,28 @@ drainlib = { path = "." }
 ```
 
 ```rust
-use drainlib::DrainParser;
+use drainlib::{ChangeType, DrainParser};
 
 let mut parser = DrainParser::new(4, 0.5, 100);
 
-let c = parser.parse("user alice logged in from 192.168.1.10");
-println!("template: {}", c.template.join(" "));
-// template: user alice logged in from <*>
+let r = parser.parse("user alice logged in");
+println!("{:?} — {}", r.change_type, r.template.join(" "));
+// New — user alice logged in
 
-let c = parser.parse("user bob logged in from 10.0.0.5");
-println!("template: {}", c.template.join(" "));
-// template: user <*> logged in from <*>
+let r = parser.parse("user bob logged in");
+println!("{:?} — {}", r.change_type, r.template.join(" "));
+// Updated — user <*> logged in
 
-for cluster in parser.clusters() {
-    println!("[{}] size={} {}", cluster.id, cluster.size, cluster.template.join(" "));
-}
+let r = parser.parse("user carol logged in");
+println!("{:?} — {}", r.change_type, r.template.join(" "));
+// None — user <*> logged in
 ```
 
-Run the bundled demo:
+Run the bundled examples:
 
 ```
-cargo run --example demo
-```
-
-Sample output:
-
-```
---- 4 unique templates discovered ---
-
-  [0] size=  5  <*> INFO <*> <*> <*> in <*> <*>
-  [1] size=  2  <*> ERROR request to <*> failed after <*> retries
-  [2] size=  3  <*> WARN disk usage at <*> percent on <*>
-  [3] size=  2  <*> INFO connection <*> closed
+cargo run --example demo     # streaming parse with change-type labels
+cargo run --example persist  # save state to JSON, reload, continue parsing
 ```
 
 ## API
@@ -56,19 +51,55 @@ Sample output:
 pub fn new(depth: usize, sim_threshold: f64, max_children: usize) -> DrainParser
 ```
 
-Creates a new parser. See [Tuning parameters](#tuning-parameters) for guidance on values.
+Creates a parser with the default mask set (digit tokens and hex addresses).  
+Use [`DrainParserBuilder`](#drainparserbuilder) for custom masking.
 
 ```rust
-pub fn parse(&mut self, line: &str) -> &LogCluster
+pub fn parse(&mut self, line: &str) -> ParseResult<'_>
 ```
 
-Processes one log line. Returns a reference to the cluster it was merged into (existing or newly created). The returned reference borrows the parser; drop it before calling `parse` again.
+Processes one log line. Returns a [`ParseResult`] that borrows the parser; drop it before the next `parse` call.
 
 ```rust
 pub fn clusters(&self) -> &[LogCluster]
 ```
 
-Returns all discovered clusters in creation order.
+All discovered clusters in creation order.
+
+```rust
+pub fn to_json(&self)        -> serde_json::Result<String>
+pub fn to_json_pretty(&self) -> serde_json::Result<String>
+pub fn from_json(s: &str)   -> Result<DrainParser, Box<dyn Error>>
+pub fn save(path)            -> Result<(), Box<dyn Error>>
+pub fn load(path)            -> Result<DrainParser, Box<dyn Error>>
+```
+
+Serialise and restore the complete parser state — clusters, prefix tree, tuning parameters, and mask patterns — as JSON.
+
+---
+
+### `ParseResult<'a>`
+
+```rust
+pub struct ParseResult<'a> {
+    pub cluster: &'a LogCluster,
+    pub change_type: ChangeType,
+}
+```
+
+Implements `Deref<Target = LogCluster>`, so `r.id`, `r.size`, and `r.template` are directly accessible.
+
+---
+
+### `ChangeType`
+
+```rust
+pub enum ChangeType {
+    New,      // a fresh cluster was created
+    Updated,  // merged into existing cluster; template gained ≥1 new "<*>"
+    None,     // merged into existing cluster; template unchanged
+}
+```
 
 ---
 
@@ -82,34 +113,70 @@ pub struct LogCluster {
 }
 ```
 
-`template` is updated in place as new lines are merged: any position where the new line differs from the current template is replaced with `"<*>"`.
+---
+
+### `DrainParserBuilder`
+
+Fluent builder for custom masking configurations.
+
+```rust
+let mut parser = DrainParserBuilder::new()
+    .depth(4)
+    .sim_threshold(0.5)
+    .max_children(100)
+    // append masks on top of the defaults (digits, hex)
+    .add_mask(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}")  // IPv4
+    .add_mask(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}")  // UUID
+    .build()?;
+```
+
+`build()` returns `Err(regex::Error)` if any pattern is invalid.  
+Use `.mask_patterns(vec![…])` to replace the default set entirely.
+
+## Persistence example
+
+```rust
+use drainlib::DrainParser;
+
+// Train on some log lines.
+let mut p = DrainParser::new(4, 0.5, 100);
+p.parse("user alice logged in");
+p.parse("user bob logged in");
+
+// Persist.
+p.save("/tmp/drain.json")?;
+
+// Reload in another process / after restart.
+let mut p2 = DrainParser::load("/tmp/drain.json")?;
+
+// Parsing continues seamlessly — clusters and tree are preserved.
+let r = p2.parse("user carol logged in");
+assert_eq!(r.id, 0);   // same cluster as alice and bob
+assert_eq!(r.size, 3);
+```
 
 ## Tuning parameters
 
 | Parameter | Type | Effect |
 |---|---|---|
-| `depth` | `usize` | Prefix-tree depth. Higher values route more selectively before cluster search, reducing false merges at the cost of more clusters. Must be ≥ 3. |
-| `sim_threshold` | `f64` (0–1) | Minimum fraction of matching tokens required to merge a line into an existing cluster. Lower values merge more aggressively. Typical range: `0.4`–`0.7`. |
-| `max_children` | `usize` | Maximum distinct token keys per internal node. Once reached, new tokens are routed under a shared `"<*>"` wildcard child, capping tree fan-out. |
+| `depth` | `usize` (≥ 3) | Prefix-tree depth. Higher = more selective routing before cluster search, fewer false merges, more clusters. |
+| `sim_threshold` | `f64` (0–1) | Minimum fraction of matching tokens to merge into an existing cluster. Typical range: `0.4`–`0.7`. |
+| `max_children` | `usize` | Max distinct token keys per internal node. Once reached, new tokens are collapsed under a `"<*>"` wildcard child. |
 
-### Recommended starting point
+**Recommended starting point:** `DrainParser::new(4, 0.5, 100)`
 
-```rust
-DrainParser::new(4, 0.5, 100)
-```
-
-Increase `sim_threshold` (e.g. `0.7`) if unrelated log patterns are being merged. Decrease `depth` (e.g. `3`) if lines with the same structure but different leading tokens are ending up in separate clusters.
+Increase `sim_threshold` if unrelated patterns are merging. Decrease `depth` if lines with the same structure but different leading tokens land in separate clusters.
 
 ## How it works
 
 Each call to `parse` runs four steps:
 
-1. **Preprocess** — split on whitespace; replace any token containing digits or a hex prefix (`0x…`) with `"<*>"`.
-2. **Tree traversal** — descend the prefix tree: level 1 branches on token count, levels 2…`depth` branch on the first tokens (collapsing to `"<*>"` once `max_children` is reached at a node).
-3. **Cluster search** — at the leaf, compute token-level similarity against each candidate cluster; select the best if its score meets `sim_threshold`.
+1. **Preprocess** — split on whitespace; replace any token that matches a mask pattern with `"<*>"`.
+2. **Tree traversal** — descend the prefix tree: level 1 branches on token count, levels 2…`depth` branch on the first tokens (collapsing to `"<*>"` at nodes that have reached `max_children`).
+3. **Cluster search** — at the leaf, compute token-level similarity against each candidate; select the best if its score meets `sim_threshold`.
 4. **Update or create** — merge the line into the matched cluster (positions that differ become `"<*>"`) or append a new `LogCluster`.
 
-The cluster list is append-only; leaf nodes in the tree hold indices into it.
+The cluster list is append-only; leaf nodes in the tree hold indices into it. The entire state is captured in a JSON snapshot for persistence.
 
 ## Development
 

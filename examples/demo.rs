@@ -1,4 +1,4 @@
-use drainlib::DrainParser;
+use drainlib::{ChangeType, DrainParser};
 
 fn main() {
     let logs = [
@@ -20,18 +20,21 @@ fn main() {
 
     println!("--- Parsing {} log lines ---\n", logs.len());
     for line in &logs {
-        let cluster = parser.parse(line);
+        let r = parser.parse(line);
+        let marker = match r.change_type {
+            ChangeType::New     => "[NEW]    ",
+            ChangeType::Updated => "[UPDATED]",
+            ChangeType::None    => "[MATCH]  ",
+        };
         println!(
-            "  line  : {}\n  cluster #{} (size={}) template: {}\n",
-            line,
-            cluster.id,
-            cluster.size,
-            cluster.template.join(" "),
+            "  {} cluster #{} (size={:2})  {}",
+            marker, r.id, r.size,
+            r.template.join(" "),
         );
     }
 
     let clusters = parser.clusters();
-    println!("--- {} unique templates discovered ---\n", clusters.len());
+    println!("\n--- {} unique templates discovered ---\n", clusters.len());
     for c in clusters {
         println!("  [{}] size={:3}  {}", c.id, c.size, c.template.join(" "));
     }
