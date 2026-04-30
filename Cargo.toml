@@ -2,6 +2,11 @@
 name = "drainlib"
 version = "0.1.0"
 edition = "2024"
+description = "A Rust implementation of the DRAIN log parsing algorithm"
+license-file = "LICENSE"
+repository = "https://github.com/vulogov/drainlib"
+categories = ["data-structures"]
+keywords = ["value", "data", "logs", "parsing", "regex"]
 
 [dependencies]
 regex = "1.12.3"
